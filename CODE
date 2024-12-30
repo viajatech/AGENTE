@@ -1,0 +1,1214 @@
+# -*- coding: utf-8 -*-
+
+"""
+AGENTE BY VIAJA TECH
+Script unificado con:
+- Apertura/cierre de programas (Word, Excel, Notepad, etc.)
+- Búsqueda de imágenes en internet (Firefox/Chrome + Selenium)
+- Memoria conversacional (recuerda preguntas anteriores)
+- Múltiples estrategias de test-time compute (Simple, Best-of-N, Weighted Best-of-N, Beam Search, DVTS)
+- Integración de algoritmos avanzados (evolutivos, enjambres, cuánticos, DRL, etc.) en dichas estrategias
+- TTS con Azure
+- STT con speech_recognition
+- Módulo de monitoreo y heurísticas para CPU, GPU, RAM, Disco
+- Ejemplo básico de auto-elevación en Windows (UAC)
+- pywin32 COM (mínimo) para manipular Word más allá de escribir en la ventana
+- ThreadPoolExecutor para llamadas LLM en paralelo
+- Basado en LM Studio (openai API pointing to localhost:1234)
+
+Requisitos de entorno:
+    pip install gradio==3.32.0
+    pip install openai==0.27.0
+    pip install azure-cognitiveservices-speech
+    pip install speechrecognition
+    pip install pyautogui
+    pip install keyboard
+    pip install requests
+    pip install selenium
+    pip install webdriver-manager  (opcional)
+    pip install pywin32
+    # Y LM Studio corriendo en http://localhost:1234/v1
+
+by David Ruiz (@viajatech) + adaptaciones solicitadas.
+Apache 2.0 License
+"""
+
+import os
+import platform
+import time
+import base64
+import urllib.parse
+import subprocess
+import random
+import requests
+import speech_recognition as sr
+import pyautogui
+import keyboard
+import webbrowser
+import gradio as gr
+
+# Azure TTS
+import azure.cognitiveservices.speech as speechsdk
+
+# Selenium
+from selenium import webdriver
+from selenium.webdriver.firefox.options import Options as FirefoxOptions
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+# from webdriver_manager.firefox import GeckoDriverManager
+# from selenium.webdriver.firefox.service import Service
+
+# Conexión a LM Studio
+from openai import OpenAI
+
+# Manejo en paralelo
+from concurrent.futures import ThreadPoolExecutor
+from collections import defaultdict
+
+# pywin32 (COM) para manipular Word más en detalle
+# Debes tener: pip install pywin32, y en Windows -> python -m pip install pywin32
+# + python -m pywin32_postinstall install
+try:
+    import win32com.client
+    PYWIN32_AVAILABLE = True
+except ImportError:
+    PYWIN32_AVAILABLE = False
+
+# =========================================
+#   CONFIGURACIÓN PRINCIPAL
+# =========================================
+
+client = OpenAI(base_url="http://localhost:1234/v1", api_key="lm-studio")
+
+AZURE_SPEECH_KEY = "TU_CLAVE_DE_AZURE"            # Reemplaza
+AZURE_SERVICE_REGION = "TU_REGION_AZURE"          # Reemplaza (ej. "eastus")
+
+# =========================================
+#   MÓDULO DE AUTO-ELEVACIÓN (UAC)
+# =========================================
+def auto_elevate_if_needed():
+    """
+    Intento de auto-elevación en Windows para saltar UAC.
+    En muchos casos, Windows requerirá confirmación manual.
+    Esto es solo un ejemplo. Realmente se recomienda ejecutar
+    el script 'Como administrador' desde un inicio.
+    """
+    if platform.system().lower() == "windows":
+        try:
+            # Ejemplo: ejecutar un powershell que se autoeleva
+            # Nota: frecuentemente te pedirá confirmación manual
+            script = r'''
+$cur = New-Object -com Shell.Application
+If (([System.Security.Principal.WindowsPrincipal] [System.Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([System.Security.Principal.WindowsBuiltInRole] "Administrator"))
+{
+  Write-Host "Ya somos administradores."
+}
+else
+{
+  $procInfo = New-Object System.Diagnostics.ProcessStartInfo "powershell";
+  $procInfo.Verb = "runas";
+  $procInfo.Arguments = "Write-Host 'AutoElevado'; Start-Sleep -Seconds 2;";
+  [System.Diagnostics.Process]::Start($procInfo) | Out-Null
+}
+'''
+            subprocess.run(['powershell.exe', script], capture_output=True, text=True)
+        except Exception as e:
+            print(f"[DEBUG] Auto-elevate falló: {str(e)}")
+
+# Llamamos a la auto-elevación (opcional).
+auto_elevate_if_needed()
+
+# =========================================
+#   MONITOREO DE RECURSOS (CPU, GPU, RAM, DISCO)
+# =========================================
+def system_monitor():
+    """
+    Ejemplo simplificado para leer (o estimar) CPU, RAM, DISK, GPU usage,
+    y retornarlo como un dict. Podríamos usar psutil, pynvml, etc.
+    """
+    stats = {
+        "cpu_usage": random.uniform(10, 80),    # placeholder
+        "ram_usage": random.uniform(20, 90),    # placeholder
+        "disk_usage": random.uniform(10, 95),   # placeholder
+        "gpu_usage": random.uniform(5, 90)      # placeholder
+    }
+    # Podríamos con psutil: psutil.cpu_percent(), psutil.virtual_memory().percent, etc.
+    return stats
+
+def decide_parallelization():
+    """
+    Ejemplo: si CPU está por encima de X% o RAM por encima de Y%,
+    reducimos threads para no saturar la máquina.
+    """
+    stats = system_monitor()
+    cpu = stats["cpu_usage"]
+    ram = stats["ram_usage"]
+
+    # Simple heurística
+    if cpu > 70 or ram > 80:
+        return 1  # un solo hilo
+    else:
+        return 4  # max 4 hilos
+
+# =========================================
+#   ESCANEO DE EJECUTABLES Y APERTURA
+# =========================================
+
+def scan_executables(drive_letters=["C"], max_depth=3):
+    found_programs = {}
+    known_keywords = {
+        "word": ["winword", "word"],
+        "excel": ["excel"],
+        "notepad": ["notepad", "bloc"],
+        "calc": ["calc", "calculator"],
+        "chrome": ["chrome"],
+        "firefox": ["firefox"]
+    }
+
+    def is_exe(filename):
+        return filename.lower().endswith(".exe")
+
+    def scan_dir(path, depth):
+        if depth > max_depth:
+            return
+        try:
+            for entry in os.scandir(path):
+                if entry.is_file() and is_exe(entry.name):
+                    fname_lower = entry.name.lower()
+                    fpath_lower = entry.path.lower()
+                    for progkey, hints in known_keywords.items():
+                        for h in hints:
+                            if h in fname_lower or h in fpath_lower:
+                                found_programs[progkey] = entry.path
+                elif entry.is_dir():
+                    scan_dir(entry.path, depth + 1)
+        except (PermissionError, FileNotFoundError):
+            pass
+
+    for d in drive_letters:
+        base = d + ":/"
+        print(f"[DEBUG] Escaneando {base} (hasta profundidad {max_depth})...")
+        scan_dir(base, 0)
+    return found_programs
+
+def open_program(program_map, program_name, opened_programs=None):
+    if opened_programs is None:
+        opened_programs = {}
+
+    prog = program_name.lower()
+    exe_path = program_map.get(prog, None)
+    if exe_path and os.path.isfile(exe_path):
+        try:
+            print(f"[DEBUG] Abriendo {exe_path} ...")
+            os.startfile(exe_path)
+            opened_programs[prog] = True
+            return True
+        except Exception as e:
+            print(f"[DEBUG] Error al abrir {exe_path}: {str(e)}")
+
+    # fallback
+    fallback_cmds = {
+        "word": ["WINWORD"],
+        "excel": ["EXCEL"],
+        "notepad": ["notepad"],
+        "calc": ["calc"],
+        "chrome": ["chrome"],
+        "firefox": ["firefox"]
+    }
+    if prog in fallback_cmds:
+        for c in fallback_cmds[prog]:
+            try:
+                print(f"[DEBUG] Abriendo fallback => {c}")
+                subprocess.Popen(c)
+                opened_programs[prog] = True
+                return True
+            except Exception as e:
+                print(f"[DEBUG] Fallback {c} falló: {str(e)}")
+
+    return False
+
+def close_all_windows():
+    if platform.system().lower() == "windows":
+        os.system("taskkill /F /IM *")
+
+def shutdown_system():
+    if platform.system().lower() == "windows":
+        os.system("shutdown /s /t 5")
+    else:
+        os.system("shutdown -h now")
+
+def restart_system():
+    if platform.system().lower() == "windows":
+        os.system("shutdown /r /t 5")
+    else:
+        os.system("shutdown -r now")
+
+def type_in_current_window(text):
+    pyautogui.typewrite(text, interval=0.02)
+
+# =========================================
+#   USO DE PYWIN32 (COM) PARA WORD
+# =========================================
+
+def focus_word_com():
+    """
+    Ejemplo de uso de pywin32 para manipular Word de forma más detallada:
+    - Abrir/Enfocar
+    - Insertar texto
+    - Moverse por párrafos
+    etc.
+    """
+    if not PYWIN32_AVAILABLE:
+        print("[DEBUG] PyWin32 no disponible, no se puede usar COM para Word.")
+        return
+
+    try:
+        word = win32com.client.Dispatch("Word.Application")
+        word.Visible = True
+        # Activar la ventana
+        word.Activate()
+    except Exception as e:
+        print(f"[DEBUG] No se pudo manipular Word via COM: {str(e)}")
+
+def insert_text_word_com(text):
+    """ Inserta texto en el documento activo de Word usando pywin32. """
+    if not PYWIN32_AVAILABLE:
+        return
+
+    try:
+        word = win32com.client.Dispatch("Word.Application")
+        doc = word.ActiveDocument
+        sel = word.Selection
+        sel.TypeText(text)
+        sel.TypeParagraph()
+    except Exception as e:
+        print(f"[DEBUG] Error insert_text_word_com: {str(e)}")
+
+# =========================================
+#   BÚSQUEDA EN INTERNET (IMÁGENES, ETC.)
+# =========================================
+
+def init_browser_firefox(headless=False):
+    options = FirefoxOptions()
+    if headless:
+        options.add_argument('--headless')
+    driver = webdriver.Firefox(options=options)
+    return driver
+
+def check_for_captcha_firefox(driver):
+    try:
+        t = driver.title.lower()
+        if "captcha" in t or "unusual traffic" in t:
+            return True
+    except:
+        pass
+    return False
+
+def search_and_get_first_image(query, headless=False, timeout=15):
+    q = urllib.parse.quote(query)
+    url = f"https://www.google.com/search?q={q}&tbm=isch&hl=es"
+    driver = init_browser_firefox(headless=headless)
+    image_url = None
+    try:
+        driver.get(url)
+        time.sleep(2)
+        if check_for_captcha_firefox(driver):
+            print("[DEBUG] Google devolvió captcha => no se puede seguir.")
+            return None
+
+        possible_sel = ["img.rg_i","img.Q4LuWd","img.t0fcAb"]
+        thumbs = []
+        for sel in possible_sel:
+            try:
+                WebDriverWait(driver, timeout).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, sel))
+                )
+                found = driver.find_elements(By.CSS_SELECTOR, sel)
+                if found:
+                    thumbs = found
+                    break
+            except:
+                pass
+
+        if not thumbs:
+            return None
+
+        thumbs[0].click()
+        time.sleep(2)
+        if check_for_captcha_firefox(driver):
+            return None
+
+        big_img_sel = ["img.n3VNCb","img.pT0Scc"]
+        for sel2 in big_img_sel:
+            big_imgs = driver.find_elements(By.CSS_SELECTOR, sel2)
+            if big_imgs:
+                for img in big_imgs:
+                    src = img.get_attribute("src")
+                    if src and src.startswith("http"):
+                        image_url = src
+                        break
+            if image_url:
+                break
+
+    finally:
+        driver.quit()
+
+    return image_url
+
+def download_image_as_base64(url):
+    if not url:
+        return None
+    try:
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        data = r.content
+        b64 = base64.b64encode(data).decode('utf-8')
+        return b64
+    except Exception as e:
+        print(f"[DEBUG] Error descargando imagen: {str(e)}")
+        return None
+
+# Búsqueda de otros datos (video, noticias, hora, fecha)
+def generic_internet_search(query):
+    """
+    Ejemplo: podríamos abrir un navegador y buscar la hora, noticias, videos, etc.
+    Dejar un placeholder
+    """
+    # Dado que es ejemplo, abrimos link de google con query
+    try:
+        q = urllib.parse.quote(query)
+        url = f"https://www.google.com/search?q={q}"
+        subprocess.Popen(["chrome", url])  # o firefox
+        # Podríamos parsear la página con selenium + beautifulsoup
+    except:
+        pass
+
+# =========================================
+#   TTS y STT
+# =========================================
+
+def speak_text_azure(text, voice_gender="Femenina"):
+    speech_config = speechsdk.SpeechConfig(subscription=AZURE_SPEECH_KEY, region=AZURE_SERVICE_REGION)
+    if voice_gender == "Femenina":
+        speech_config.speech_synthesis_voice_name = "es-ES-ElviraNeural"
+    else:
+        speech_config.speech_synthesis_voice_name = "es-ES-AlvaroNeural"
+
+    audio_config = speechsdk.audio.AudioOutputConfig(use_default_speaker=True)
+    synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=audio_config)
+    synthesizer.speak_text_async(text)
+
+def transcribe_audio():
+    rec = sr.Recognizer()
+    with sr.Microphone() as source:
+        print("Escuchando...")
+        audio = rec.listen(source)
+    try:
+        text = rec.recognize_google(audio, language='es-ES')
+        return text
+    except sr.UnknownValueError:
+        return "No pude entender el audio."
+    except sr.RequestError as e:
+        return f"Error al conectar con Google Speech Recognition: {str(e)}"
+
+# =========================================
+#   AYUDAS: HISTORIAL Y REWARD
+# =========================================
+
+def dummy_reward_function(text):
+    return len(text)
+
+def build_conversation_history(messages):
+    hist = []
+    for m in messages:
+        if m["role"] == "system":
+            continue
+        if m["role"] == "user":
+            hist.append(f"Usuario: {m['content']}")
+        elif m["role"] == "assistant":
+            hist.append(f"Asistente: {m['content']}")
+    return "\n".join(hist)
+
+# =========================================
+#   ESTRATEGIAS / ALGORITMOS AVANZADOS
+# =========================================
+
+# A) DRL (Deep Reinforcement Learning) - Ejemplo muy simplificado
+def drl_policy_decision(possible_solutions):
+    """
+    Simulación de un DRL que "selecciona" la mejor acción.
+    Realmente aquí se hace algo random, pero en la práctica
+    habría una red neuronal profunda entrenada.
+    """
+    # En la realidad, haríamos un forward pass con la red, etc.
+    # Aquí devolvemos la "respuesta" con mayor "dummy_reward"
+    best_sol = None
+    best_score = float("-inf")
+    for sol in possible_solutions:
+        sc = dummy_reward_function(sol)
+        if sc > best_score:
+            best_score = sc
+            best_sol = sol
+    return best_sol
+
+# B) PSO (Particle Swarm Optimization) - Ejemplo tonto
+def pso_combine_solutions(solutions):
+    """
+    Normalmente PSO se usa en espacios continuos. Aquí inventamos un ejemplo
+    donde "combinamos" cadenas con un pseudo-proceso de enjambre.
+    """
+    if not solutions:
+        return "No solutions"
+    # Tomamos la longitud media de las soluciones y concatenamos la "mitad" de cada.
+    partials = []
+    for sol in solutions:
+        half_idx = len(sol)//2
+        partials.append(sol[:half_idx])
+    return " ".join(partials) + " [PSO-Combined]"
+
+# C) Memetic Algorithm
+def memetic_refine_solutions(solutions):
+    """
+    Combinamos local search con un GA-like approach:
+    Tomamos la 'best' y la 'worst' y creamos un crossover
+    + "mutación" sencilla.
+    """
+    if len(solutions) < 2:
+        return solutions
+    # Ordénalas
+    solutions_sorted = sorted(solutions, key=lambda x: dummy_reward_function(x))
+    best = solutions_sorted[-1]
+    worst = solutions_sorted[0]
+
+    # Crossover a mitad
+    half = len(best)//2
+    new_sol = best[:half] + worst[half:]
+
+    # Mutación (insertar algo random)
+    if len(new_sol) > 5:
+        idx_mut = random.randint(0, len(new_sol)-1)
+        new_sol = new_sol[:idx_mut] + "[MUT]" + new_sol[idx_mut:]
+
+    # Reemplazamos la peor con la nueva
+    solutions_sorted[0] = new_sol
+    return solutions_sorted
+
+# D) Ejemplo de Computación Evolutiva Cuántica (QEA) - placeholder
+def qea_heuristic(solutions):
+    """
+    Teóricamente mezclaríamos qubits y se haría un update
+    basado en estados cuánticos. Aquí, un simple shuffle + pick best.
+    """
+    random.shuffle(solutions)
+    # pick best by reward
+    best = drl_policy_decision(solutions)
+    return best
+
+# =========================================
+#   ESTRATEGIAS DE TEST-TIME (MODIFICADAS)
+# =========================================
+
+def strategy_simple(context, user_message, depth, model, temperature, full_messages=None):
+    """
+    - Añadimos un "pequeño DRL" al final para ver si la respuesta es la "óptima"
+      o generamos otra. (Pseudo-ejemplo)
+    """
+    if full_messages is not None:
+        conv_hist = build_conversation_history(full_messages)
+        context = f"{context}\n\nHistorial:\n{conv_hist}"
+
+    thinking_prompt = f"""
+Eres un potente asistente A.I.
+El usuario dice: "{user_message}"
+
+Genera un razonamiento interno con {depth} pasos,
+luego da la respuesta final.
+
+Formato:
+Pensamiento del Agente: ...
+Respuesta Final: ...
+    """.strip()
+
+    messages_for_api = [
+        {"role": "system", "content": context},
+        {"role": "system", "content": thinking_prompt},
+        {"role": "user",   "content": user_message}
+    ]
+
+    try:
+        comp = client.chat.completions.create(
+            model=model,
+            messages=messages_for_api,
+            temperature=temperature
+        )
+        raw_response = comp.choices[0].message.content.strip()
+    except Exception as e:
+        return f"Error en strategy_simple: {str(e)}"
+
+    # Ejemplo: DRL "evalúa" si la respuesta final es buena.
+    # En la práctica, haríamos N tries y DRL pick.
+    possible_solutions = [raw_response]
+    final = drl_policy_decision(possible_solutions)
+    return final
+
+def strategy_best_of_n(context, user_message, n, model, temperature, full_messages=None):
+    """
+    - Usamos PSO (Particle Swarm) para combinar las N soluciones en 1 final
+      a modo de ejemplo.
+    """
+    if full_messages is not None:
+        conv_hist = build_conversation_history(full_messages)
+        context = f"{context}\n\nHistorial:\n{conv_hist}"
+
+    def generate_solution(_):
+        prompt = f"""
+Eres un potente asistente A.I.
+El usuario dice: "{user_message}"
+Genera UNA respuesta con "Respuesta Final:" al final.
+        """
+        msgs = [
+            {"role": "system", "content": context},
+            {"role": "system", "content": prompt},
+            {"role": "user",   "content": user_message}
+        ]
+        try:
+            c = client.chat.completions.create(
+                model=model,
+                messages=msgs,
+                temperature=temperature
+            )
+            return c.choices[0].message.content.strip()
+        except Exception as e:
+            return f"Error generando: {str(e)}"
+
+    max_workers = min(n, decide_parallelization())
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(generate_solution, i) for i in range(n)]
+        solutions = [f.result() for f in futures]
+
+    # PSO combine
+    final_solution = pso_combine_solutions(solutions)
+    return final_solution
+
+def strategy_weighted_best_of_n(context, user_message, n, model, temperature, full_messages=None):
+    """
+    - Añadimos un Memetic Algorithm para refinar las N soluciones y quedarnos con la mejor.
+    """
+    if full_messages is not None:
+        conv_hist = build_conversation_history(full_messages)
+        context = f"{context}\n\nHistorial:\n{conv_hist}"
+
+    solution_scores = defaultdict(float)
+
+    def generate_solution(_):
+        prompt = f"""
+Eres un potente asistente A.I.
+El usuario dice: "{user_message}"
+Genera UNA respuesta con "Respuesta Final:" al final.
+        """
+        msgs = [
+            {"role": "system", "content": context},
+            {"role": "system", "content": prompt},
+            {"role": "user",   "content": user_message}
+        ]
+        try:
+            c = client.chat.completions.create(
+                model=model,
+                messages=msgs,
+                temperature=temperature
+            )
+            return c.choices[0].message.content.strip()
+        except Exception as e:
+            return f"Error generando: {str(e)}"
+
+    max_workers = min(n, decide_parallelization())
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(generate_solution, i) for i in range(n)]
+        all_solutions = [f.result() for f in futures]
+
+    # Memetic refinement
+    refined_solutions = memetic_refine_solutions(all_solutions)
+
+    for sol in refined_solutions:
+        sc = dummy_reward_function(sol)
+        solution_scores[sol] += sc
+
+    best_sol = None
+    best_score_sum = float("-inf")
+    for s, sc_sum in solution_scores.items():
+        if sc_sum > best_score_sum:
+            best_score_sum = sc_sum
+            best_sol = s
+
+    return best_sol or "No se encontró solución."
+
+def strategy_beam_search(context, user_message, beam_iterations, model, temperature, full_messages=None):
+    """
+    - Al final, aplicamos QEA (qea_heuristic) para elegir la mejor rama.
+    """
+    if full_messages is not None:
+        conv_hist = build_conversation_history(full_messages)
+        context = f"{context}\n\nHistorial:\n{conv_hist}"
+
+    beam_width = 3
+    beams = ["(Inicio)"]
+
+    for step in range(beam_iterations):
+        new_beams = []
+        for b_text in beams:
+            with ThreadPoolExecutor(max_workers=beam_width) as executor:
+                futures = []
+                for _ in range(beam_width):
+                    prompt = f"""
+Eres un potente asistente A.I.
+Respuesta parcial: "{b_text}"
+Usuario: "{user_message}"
+Sigue. Termina con "Respuesta Final:" cuando esté listo.
+                    """
+                    msgs = [
+                        {"role": "system", "content": context},
+                        {"role": "system", "content": prompt},
+                    ]
+                    futures.append(executor.submit(
+                        client.chat.completions.create,
+                        model=model,
+                        messages=msgs,
+                        temperature=temperature
+                    ))
+                for fut in futures:
+                    try:
+                        c = fut.result()
+                        new_text = c.choices[0].message.content.strip()
+                        combined = b_text + " " + new_text
+                        new_beams.append(combined)
+                    except Exception as e:
+                        new_beams.append(b_text + f" [Error: {str(e)}]")
+
+        scored = [(b, dummy_reward_function(b)) for b in new_beams]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        beams = [x[0] for x in scored[:beam_width]]
+
+    # QEA para la selección final
+    final = qea_heuristic(beams)
+    return final
+
+def strategy_dvts(context, user_message, total_subtrees, model, temperature, full_messages=None):
+    """
+    - En DVTS hacemos un pseudoloop + DRL, de ejemplo.
+      Realmente se podrían meter varios de los algoritmos en su pipeline.
+    """
+    if full_messages is not None:
+        conv_hist = build_conversation_history(full_messages)
+        context = f"{context}\n\nHistorial:\n{conv_hist}"
+
+    sub_arboles = 3
+    expansion_steps = max(1, total_subtrees // sub_arboles)
+    roots = [f"Raíz_{i}" for i in range(sub_arboles)]
+    final_solutions = []
+
+    for root in roots:
+        current_text = root
+        for _ in range(expansion_steps):
+            prompt = f"""
+Eres un potente asistente A.I.
+Subárbol '{root}': "{current_text}"
+Usuario: "{user_message}"
+Expande. Termina con "Respuesta Final:" al final.
+            """
+            msgs = [
+                {"role": "system", "content": context},
+                {"role": "system", "content": prompt}
+            ]
+            try:
+                c = client.chat.completions.create(
+                    model=model,
+                    messages=msgs,
+                    temperature=0.2
+                )
+                new_text = c.choices[0].message.content.strip()
+                current_text += " " + new_text
+            except Exception as e:
+                current_text += f" [Error DVTS: {str(e)}]"
+                break
+        final_solutions.append(current_text)
+
+    # DRL para elegir la "mejor"
+    final = drl_policy_decision(final_solutions)
+    return final
+
+# =========================================
+#   CHATBOT (AGENTE)
+# =========================================
+
+def chatbot(
+    user_message,
+    messages,
+    user_name,
+    bot_name,
+    temperature,
+    model,
+    strategy,
+    test_time_compute,
+    program_map,
+    opened_programs
+):
+    conversation_history = build_conversation_history(messages)
+    combined_context = (
+        messages[0]["content"]
+        + "\n\n=== HISTORIAL ===\n"
+        + conversation_history
+        + "\n\nEl usuario dice: "
+        + user_message
+    )
+
+    lower_msg = user_message.lower().strip()
+
+    # ---------- DETECCIÓN DE COMANDOS -------------
+    if "abre" in lower_msg:
+        for c in ["word","excel","notepad","calc","chrome","firefox"]:
+            if c in lower_msg:
+                succ = open_program(program_map, c, opened_programs)
+                if succ:
+                    rep = f"Abriendo {c}... (con permisos auto-elevados si corresponde)"
+                    messages.append({"role": "assistant", "content": rep})
+                    return rep, messages, program_map, opened_programs
+
+    if "escribe" in lower_msg:
+        splitted = lower_msg.split("escribe", 1)
+        text_to_type = splitted[-1].strip()
+
+        if "word" in lower_msg:
+            # Intentemos manipulación COM
+            if opened_programs.get("word"):
+                focus_word_com()
+                time.sleep(2)
+                insert_text_word_com(text_to_type)  # Intento con pywin32
+                # fallback
+                for _ in range(3):
+                    time.sleep(1)
+                rep = f"Insertado en Word (COM): {text_to_type}"
+                messages.append({"role": "assistant", "content": rep})
+                return rep, messages, program_map, opened_programs
+            else:
+                # abrir word
+                succ = open_program(program_map, "word", opened_programs)
+                if succ:
+                    time.sleep(3)
+                    focus_word_com()
+                    time.sleep(2)
+                    insert_text_word_com(text_to_type)
+                    rep = f"Abrí Word y añadí (COM) tu texto: {text_to_type}"
+                    messages.append({"role": "assistant", "content": rep})
+                    return rep, messages, program_map, opened_programs
+                else:
+                    rep = "No pude abrir Word."
+                    messages.append({"role": "assistant", "content": rep})
+                    return rep, messages, program_map, opened_programs
+
+        elif "excel" in lower_msg:
+            if opened_programs.get("excel"):
+                ok = type_with_retry(text_to_type)
+                rep = f"Escribiendo en Excel: {text_to_type}" if ok else "No pude escribir en Excel."
+                messages.append({"role": "assistant", "content": rep})
+                return rep, messages, program_map, opened_programs
+            else:
+                succ = open_program(program_map, "excel", opened_programs)
+                if succ:
+                    time.sleep(4)
+                    ok = type_with_retry(text_to_type)
+                    rep = f"Abrí Excel y escribí: {text_to_type}" if ok else "Abrí Excel, pero no pude escribir."
+                    messages.append({"role": "assistant", "content": rep})
+                    return rep, messages, program_map, opened_programs
+                else:
+                    rep = "No pude abrir Excel."
+                    messages.append({"role": "assistant", "content": rep})
+                    return rep, messages, program_map, opened_programs
+
+        elif "notepad" in lower_msg or "bloc" in lower_msg:
+            if opened_programs.get("notepad"):
+                ok = type_with_retry(text_to_type)
+                rep = f"Escribiendo en Notepad: {text_to_type}" if ok else "No pude escribir en Notepad."
+                messages.append({"role": "assistant", "content": rep})
+                return rep, messages, program_map, opened_programs
+            else:
+                succ = open_program(program_map, "notepad", opened_programs)
+                if succ:
+                    time.sleep(2)
+                    ok = type_with_retry(text_to_type)
+                    rep = f"Abrí Notepad y escribí: {text_to_type}" if ok else "Abrí Notepad, pero no pude escribir."
+                    messages.append({"role": "assistant", "content": rep})
+                    return rep, messages, program_map, opened_programs
+                else:
+                    rep = "No pude abrir Notepad."
+                    messages.append({"role": "assistant", "content": rep})
+                    return rep, messages, program_map, opened_programs
+
+        elif "calc" in lower_msg or "calculadora" in lower_msg:
+            if opened_programs.get("calc"):
+                ok = type_with_retry(text_to_type)
+                rep = f"Escribiendo en Calculadora: {text_to_type}" if ok else "No pude escribir en la calculadora."
+                messages.append({"role": "assistant", "content": rep})
+                return rep, messages, program_map, opened_programs
+            else:
+                succ = open_program(program_map, "calc", opened_programs)
+                if succ:
+                    time.sleep(2)
+                    ok = type_with_retry(text_to_type)
+                    rep = f"Abrí la calculadora y escribí: {text_to_type}" if ok else "No pude escribir en la calculadora."
+                    messages.append({"role": "assistant", "content": rep})
+                    return rep, messages, program_map, opened_programs
+                else:
+                    rep = "No pude abrir la calculadora."
+                    messages.append({"role": "assistant", "content": rep})
+                    return rep, messages, program_map, opened_programs
+
+        else:
+            # genérico
+            ok = type_with_retry(text_to_type)
+            rep = f"Escribiendo en ventana activa: {text_to_type}" if ok else "No pude escribir en la ventana activa."
+            messages.append({"role": "assistant", "content": rep})
+            return rep, messages, program_map, opened_programs
+
+    if "cierra todas" in lower_msg and "ventanas" in lower_msg:
+        close_all_windows()
+        rep = "Cerrando todas las ventanas..."
+        messages.append({"role": "assistant", "content": rep})
+        return rep, messages, program_map, opened_programs
+
+    if "reinicia" in lower_msg or "reiniciar" in lower_msg:
+        restart_system()
+        rep = "Reiniciando sistema..."
+        messages.append({"role": "assistant", "content": rep})
+        return rep, messages, program_map, opened_programs
+
+    if "apaga" in lower_msg or "apagar" in lower_msg:
+        shutdown_system()
+        rep = "Apagando sistema..."
+        messages.append({"role": "assistant", "content": rep})
+        return rep, messages, program_map, opened_programs
+
+    if ("busca" in lower_msg or "buscar" in lower_msg) and "imagen" in lower_msg:
+        q = lower_msg.replace("busca","").replace("buscar","").replace("imagen","").strip()
+        url = search_and_get_first_image(q, headless=False)
+        if url:
+            b64 = download_image_as_base64(url)
+            if b64:
+                msg = f"¡Encontré esta imagen de '{q}'!"
+                messages.append({"role": "assistant", "content": msg})
+                messages.append({"role": "assistant", "content": "[Imagen encontrada]", "image_base64": b64})
+                return msg, messages, program_map, opened_programs
+            else:
+                msg = f"No pude descargar la imagen de '{q}'."
+                messages.append({"role": "assistant", "content": msg})
+                return msg, messages, program_map, opened_programs
+        else:
+            msg = f"No se encontró imagen (o captcha) de '{q}'."
+            messages.append({"role": "assistant", "content": msg})
+            return msg, messages, program_map, opened_programs
+
+    # Búsquedas de otro tipo (videos, noticias, hora, fecha)
+    if ("busca" in lower_msg or "buscar" in lower_msg) and any(x in lower_msg for x in ["video","noticia","hora","fecha"]):
+        # simple
+        query = lower_msg.replace("busca","").replace("buscar","").strip()
+        generic_internet_search(query)
+        rep = f"Abriendo búsqueda de '{query}' en el navegador."
+        messages.append({"role": "assistant", "content": rep})
+        return rep, messages, program_map, opened_programs
+
+    # --------- ESTRATEGIAS -----------
+    if strategy == "Simple":
+        response = strategy_simple(
+            context=combined_context,
+            user_message=user_message,
+            depth=test_time_compute,
+            model=model,
+            temperature=temperature,
+            full_messages=messages
+        )
+    elif strategy == "Best-of-N":
+        response = strategy_best_of_n(
+            context=combined_context,
+            user_message=user_message,
+            n=test_time_compute,
+            model=model,
+            temperature=temperature,
+            full_messages=messages
+        )
+    elif strategy == "Weighted Best-of-N":
+        response = strategy_weighted_best_of_n(
+            context=combined_context,
+            user_message=user_message,
+            n=test_time_compute,
+            model=model,
+            temperature=temperature,
+            full_messages=messages
+        )
+    elif strategy == "Beam Search":
+        response = strategy_beam_search(
+            context=combined_context,
+            user_message=user_message,
+            beam_iterations=test_time_compute,
+            model=model,
+            temperature=temperature,
+            full_messages=messages
+        )
+    elif strategy == "DVTS":
+        response = strategy_dvts(
+            context=combined_context,
+            user_message=user_message,
+            total_subtrees=test_time_compute,
+            model=model,
+            temperature=temperature,
+            full_messages=messages
+        )
+    else:
+        response = strategy_simple(
+            context=combined_context,
+            user_message=user_message,
+            depth=1,
+            model=model,
+            temperature=temperature,
+            full_messages=messages
+        )
+
+    messages.append({"role": "user", "content": f"{user_name}: {user_message}"})
+    messages.append({"role": "assistant", "content": response})
+    return response, messages, program_map, opened_programs
+
+# =========================================
+#   INTERFAZ GRADIO
+# =========================================
+
+def start_chatbot(
+    context,
+    user,
+    bot,
+    temperature,
+    model,
+    voice_gender,
+    strategy,
+    test_time_compute
+):
+    program_map = scan_executables(["C"], max_depth=3)
+    print("[DEBUG] Program map detectado:", program_map)
+    opened_programs = {}
+
+    messages = [
+        {"role": "system", "content": context},
+        {"role": "assistant", "content": f"¡Hola {user}! Soy {bot}. ¿En qué puedo ayudarte hoy?"}
+    ]
+    chat_history = [{"role": "assistant", "content": messages[-1]["content"]}]
+
+    return (
+        chat_history,
+        messages,
+        user,
+        bot,
+        temperature,
+        model,
+        voice_gender,
+        strategy,
+        test_time_compute,
+        program_map,
+        opened_programs,
+        gr.update(interactive=True)
+    )
+
+def send_message(
+    user_message,
+    chat_history,
+    messages,
+    user_name,
+    bot_name,
+    temperature,
+    model,
+    use_voice,
+    voice_gender,
+    strategy,
+    test_time_compute,
+    program_map,
+    opened_programs
+):
+    if messages is None:
+        return "Primero haz clic en 'Iniciar Chatbot'.", chat_history, messages, program_map, opened_programs
+
+    bot_response, messages, program_map, opened_programs = chatbot(
+        user_message,
+        messages,
+        user_name,
+        bot_name,
+        temperature,
+        model,
+        strategy,
+        test_time_compute,
+        program_map,
+        opened_programs
+    )
+
+    last_assistant_msgs = [m for m in messages if m["role"] == "assistant"]
+    if last_assistant_msgs:
+        content = last_assistant_msgs[-1].get("content","")
+        image_b64 = last_assistant_msgs[-1].get("image_base64")
+        if image_b64:
+            content += f"<br><img src='data:image/png;base64,{image_b64}' alt='Imagen' style='max-width:300px;'/>"
+            bot_response = content
+
+    chat_history.append({"role": "user", "content": f"{user_name}: {user_message}"})
+    chat_history.append({"role": "assistant", "content": f"{bot_name}: {bot_response}"})
+
+    if use_voice:
+        speak_text_azure(bot_response, voice_gender)
+
+    return "", chat_history, messages, program_map, opened_programs
+
+def clear_history():
+    return (
+        [],
+        [],
+        "",
+        "",
+        0.5,
+        "meta-llama-3.1-8b-instruct",
+        "Femenina",
+        "Simple",
+        1,
+        {},
+        {},
+        gr.update(interactive=False)
+    )
+
+with gr.Blocks(theme=gr.themes.Soft()) as demo:
+    gr.Markdown("<h1 style='color: purple;'>Agente by Viaja Tech")
+
+    with gr.Tab("Configuración"):
+        with gr.Row():
+            context = gr.Textbox(
+                label="Contexto inicial (rol=system)",
+                lines=3,
+                value=(
+                    "Eres un asistente autónomo capaz de abrir y manejar programas, "
+                    "buscar imágenes y datos en internet, y razonar con diferentes algoritmos avanzados."
+                )
+            )
+        with gr.Row():
+            user_input = gr.Textbox(label="Tu nombre", value="Usuario")
+            bot_input = gr.Textbox(label="Nombre del chatbot", value="Agente by Viaja Tech")
+
+        with gr.Row():
+            temperature = gr.Slider(label="Temperatura (0-1)", minimum=0.0, maximum=1.0, value=0.5, step=0.1)
+            model = gr.Textbox(label="Modelo (LM Studio)", value="meta-llama-3.1-8b-instruct")
+
+        with gr.Row():
+            use_voice = gr.Checkbox(label="Activar TTS Azure", value=False)
+            voice_gender = gr.Radio(label="Voz TTS", choices=["Femenina","Masculina"], value="Femenina")
+
+        with gr.Row():
+            strategy = gr.Radio(
+                label="Estrategia Test-time Compute",
+                choices=["Simple","Best-of-N","Weighted Best-of-N","Beam Search","DVTS"],
+                value="Simple"
+            )
+            test_time_compute = gr.Slider(label="Nivel/Iteraciones (1-10)", minimum=1, maximum=10, value=1, step=1)
+
+        start_button = gr.Button("Iniciar Chatbot")
+
+    with gr.Tab("Chat"):
+        chat_history = gr.Chatbot(label="Historial", type="messages")
+        with gr.Row():
+            message_input = gr.Textbox(label="Mensaje")
+            send_button = gr.Button("Enviar", interactive=False)
+        voice_input_button = gr.Button("Hablar (Micro)")
+        clear_button = gr.Button("Borrar Historial")
+
+    state_messages = gr.State()
+    state_user_name = gr.State()
+    state_bot_name = gr.State()
+    state_temperature = gr.State()
+    state_model = gr.State()
+    state_voice_gender = gr.State()
+    state_strategy = gr.State()
+    state_test_time = gr.State()
+    state_program_map = gr.State()
+    state_opened_programs = gr.State()
+
+    start_button.click(
+        start_chatbot,
+        inputs=[
+            context,
+            user_input,
+            bot_input,
+            temperature,
+            model,
+            voice_gender,
+            strategy,
+            test_time_compute
+        ],
+        outputs=[
+            chat_history,
+            state_messages,
+            state_user_name,
+            state_bot_name,
+            state_temperature,
+            state_model,
+            state_voice_gender,
+            state_strategy,
+            state_test_time,
+            state_program_map,
+            state_opened_programs,
+            send_button
+        ]
+    )
+
+    send_button.click(
+        send_message,
+        inputs=[
+            message_input,
+            chat_history,
+            state_messages,
+            state_user_name,
+            state_bot_name,
+            state_temperature,
+            state_model,
+            use_voice,
+            state_voice_gender,
+            state_strategy,
+            state_test_time,
+            state_program_map,
+            state_opened_programs
+        ],
+        outputs=[
+            message_input,
+            chat_history,
+            state_messages,
+            state_program_map,
+            state_opened_programs
+        ]
+    )
+
+    voice_input_button.click(
+        transcribe_audio,
+        inputs=None,
+        outputs=message_input
+    )
+
+    clear_button.click(
+        clear_history,
+        outputs=[
+            chat_history,
+            state_messages,
+            state_user_name,
+            state_bot_name,
+            state_temperature,
+            state_model,
+            state_voice_gender,
+            state_strategy,
+            state_test_time,
+            state_program_map,
+            state_opened_programs,
+            send_button
+        ]
+    )
+
+    demo.launch(share=True)
